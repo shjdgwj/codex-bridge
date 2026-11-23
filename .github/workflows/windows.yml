@@ -14,6 +14,7 @@ on:
         default: all
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: windows-${{ github.ref }}-${{ inputs.architecture || 'all' }}
@@ -29,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        architecture: ${{ fromJSON(inputs.architecture == 'arm64' && '["arm64"]' || inputs.architecture == 'x64' && '["x64"]' || '["x64","arm64"]') }}
+        architecture: [x64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,6 +172,17 @@ jobs:
         with:
           path: Packages/BridgeCore/.build/repositories
           key: ${{ steps.swift-dependencies-cache.outputs.cache-primary-key }}
+      - name: Verify idle stderr and sequential stdout
+        shell: pwsh
+        run: |
+          $processRoot = Join-Path $env:GITHUB_WORKSPACE "Packages/BridgeCore/Sources/BridgeProcess"
+          $sources = @(Get-ChildItem -LiteralPath $processRoot -Filter "Managed*.swift" -File | ForEach-Object FullName)
+          $sources += Join-Path $processRoot "PipeWriteSignalGuard.swift"
+          $check = Join-Path $env:GITHUB_WORKSPACE ".build/verify-managed-stdio.exe"
+          swiftc -parse-as-library -module-name VerifyManagedStdio @sources Scripts/verify-managed-stdio.swift -o $check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build service and Windows shell
         working-directory: Packages/BridgeCore
         shell: pwsh
@@ -192,6 +204,14 @@ jobs:
           $binPath = ($binPathOutput | Select-Object -Last 1).ToString().Trim()
           if (-not $binPath) { throw "Swift build output directory was empty." }
           Add-Content $env:GITHUB_ENV "SWIFT_BIN_PATH=$binPath"
+      - name: Upload native Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-bridge-windows-${{ matrix.architecture }}-native
+          path: |
+            ${{ env.SWIFT_BIN_PATH }}/codex-bridge-windows-app.exe
+            ${{ env.SWIFT_BIN_PATH }}/codex-bridge-service.exe
+          if-no-files-found: error
       - uses: actions/setup-node@v4
         with:
           node-version: 24.11.1
@@ -266,12 +286,21 @@ jobs:
         with:
           path: .build/tunnel-client/${{ matrix.architecture }}
           key: ${{ steps.tunnel-cache.outputs.cache-primary-key }}
-      - name: Build embedded DSH runtime
+      - name: Download unchanged embedded runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-bridge-windows-x64
+          path: .build/previous-portable
+          run-id: 45134071465
+          github-token: ${{ github.token }}
+      - name: Stage unchanged embedded runtime
         shell: pwsh
         run: |
-          $runtime = Join-Path $env:GITHUB_WORKSPACE ".build\embedded-dsh\windows-${{ matrix.architecture }}"
-          node Scripts/build-embedded-dsh-runtime.mjs --platform windows --arch "${{ matrix.architecture }}" --output $runtime
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $previous = Join-Path $env:GITHUB_WORKSPACE ".build/previous-portable"
+          Expand-Archive -LiteralPath (Join-Path $previous "codex-bridge-windows-x64.zip") -DestinationPath (Join-Path $previous "payload")
+          $runtimeRoot = Join-Path $env:GITHUB_WORKSPACE ".build/embedded-dsh"
+          New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+          Move-Item -LiteralPath (Join-Path $previous "payload/EmbeddedDSH") -Destination (Join-Path $runtimeRoot "windows-x64")
       - name: Stage Windows portable package
         shell: pwsh
         run: |
